@@ -40,11 +40,7 @@ import {
   paymentFailedCounter,
 } from "../lib/metrics.js";
 import { sanitizeMetadataMiddleware } from "../lib/sanitize-metadata.js";
-import {
-  resolveAndValidateIssuer,
-  validatePerAssetLimits,
-  validateAllowedIssuers,
-} from "../lib/payment-session-rules.js";
+import { validatePaymentSession } from "../lib/payment-session-validator.js";
 import { getSupabaseClient } from "../lib/supabase-client.js";
 import { insertPaymentSessionWithRetry } from "../lib/payment-session-retry.js";
 import {
@@ -301,6 +297,32 @@ function createPaymentsRouter({
       logger.error({ err, merchantId: req.merchant?.id }, "DEBUG: createSession error");
       if (err.status === 400 && err.details) {
         return res.status(400).json({ error: err.message, ...err.details });
+      const supabase = await getSupabaseClient();
+      logger.info({ merchantId: req.merchant?.id, amount: req.body?.amount, asset: req.body?.asset }, "DEBUG: createSession started");
+
+      // Sanitization, strict payload checks and shared business rules
+      // (issues #1087, #1447) with validator metrics/health (#1448).
+      const validation = validatePaymentSession({
+        body: req.body,
+        merchant: req.merchant,
+        source: "http",
+      });
+      if (!validation.ok) {
+        const { rejection } = validation;
+        const assetLabel = req.body?.asset;
+        paymentFailedCounter.inc({
+          asset: assetLabel,
+          reason: rejection.reason === "issuer_not_allowed" ? "invalid_issuer" : rejection.reason,
+        });
+        paymentProcessorSessionsTotal.inc({ asset: assetLabel, outcome: "validation_failed" });
+        paymentProcessorSessionDuration.observe(
+          { asset: assetLabel, outcome: "validation_failed" },
+          (Date.now() - sessionStart) / 1000,
+        );
+        return res.status(400).json({
+          error: rejection.message,
+          ...(rejection.rule === "limits" ? rejection.details : {}),
+        });
       }
       next(err);
     }
@@ -327,6 +349,8 @@ function createPaymentsRouter({
       );
       return res.status(400).json({ error: issuerRejection.message });
     }
+      const body = validation.payload;
+      const { asset, assetIssuer } = validation;
 
     // Shared business-rule validation (issue #1087) — per-asset limits (#153).
     const limitRejection = validatePerAssetLimits({

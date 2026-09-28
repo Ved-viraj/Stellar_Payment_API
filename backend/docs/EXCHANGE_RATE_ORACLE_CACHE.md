@@ -3,7 +3,8 @@
 Caching and concurrency control for path-payment exchange-rate quotes
 (`GET /api/path-payment-quote/:id`).
 
-Covers issues **#1445** (distributed concurrency control and locking) and
+Covers issues **#1443** (Prometheus alert metrics and health telemetry),
+**#1445** (distributed concurrency control and locking) and
 **#1446** (integration and stress test suite).
 
 ---
@@ -16,6 +17,8 @@ Covers issues **#1445** (distributed concurrency control and locking) and
 | `src/lib/exchange-rate-coordinator.js` | Cross-instance coordination: Redis lock + shared quote store |
 | `src/services/exchangeRateService.js` | `getExchangeRateQuote()` composes both layers around the Horizon query |
 | `src/lib/path-payment-metrics.js` | Prometheus series (existing cache metrics + concurrency metrics) |
+| `src/lib/exchange-rate-oracle-telemetry.js` | Alert metrics, rolling-window health, separate registry (#1443) |
+| `docs/alerts/exchange-rate-oracle-cache.rules.yml` | Prometheus alert rules (#1443) |
 
 ```
 getExchangeRateQuote(key)
@@ -154,11 +157,65 @@ HTTP bursts wait until every request has joined the in-flight load, using
 Horizon response. supertest opens a separate server per request, so arrival
 order is otherwise not guaranteed.
 
+## 8. Alert metrics and health (#1443)
+
+Lookups and loads are counted in `exchange-rate-oracle-telemetry.js`, separate
+from the path-payment series so a scrape can alert on the cache itself.
+`/metrics` merges the registry. Every label is from a fixed set (`hit`,
+`miss`, `stale`, `success`, `error`, `timeout`, `not_found`). Asset codes,
+issuers, amounts and cache keys are never labels.
+
+| Metric | Type | Labels |
+|---|---|---|
+| `exchange_rate_oracle_cache_lookups_total` | counter | `result` (hit/miss/stale) |
+| `exchange_rate_oracle_cache_loads_total` | counter | `outcome` (success/error/timeout/not_found) |
+| `exchange_rate_oracle_cache_load_duration_seconds` | histogram | `outcome` |
+| `exchange_rate_oracle_cache_health_state` | gauge | 0 healthy, 1 degraded, 2 unhealthy |
+| `exchange_rate_oracle_cache_error_ratio` | gauge | rolling window |
+| `exchange_rate_oracle_cache_timeout_ratio` | gauge | rolling window |
+| `exchange_rate_oracle_cache_stale_ratio` | gauge | rolling window |
+| `exchange_rate_oracle_cache_last_load_timestamp_seconds` | gauge | none |
+
+`not_found` is a normal "Horizon has no path" result. It is counted, but it
+does not move the error ratio and cannot mark the cache unhealthy.
+
+`GET /health/exchange-rate-oracle-cache` (public, no quote or account data):
+
+| Status | Condition | HTTP |
+|---|---|---|
+| `unhealthy` | ≥ `min_samples` loads and internal error ratio ≥ threshold | 503 |
+| `degraded` | ≥ `min_samples` loads and timeout ratio ≥ threshold, **or** ≥ `min_samples` lookups and stale ratio ≥ threshold | 200 |
+| `healthy` | otherwise, including no traffic | 200 |
+
+`GET /health` also reports `services.exchange_rate_oracle_cache`. That value
+does not change `ok` or the status code. Gauges refresh at scrape time, so
+they decay when traffic stops. The window is a fixed ring of 5-second buckets.
+
+| Variable | Default |
+|---|---|
+| `EXCHANGE_RATE_ORACLE_HEALTH_WINDOW_MS` | `300000` |
+| `EXCHANGE_RATE_ORACLE_HEALTH_MIN_SAMPLES` | `20` |
+| `EXCHANGE_RATE_ORACLE_ERROR_RATIO_THRESHOLD` | `0.05` |
+| `EXCHANGE_RATE_ORACLE_TIMEOUT_RATIO_THRESHOLD` | `0.2` |
+| `EXCHANGE_RATE_ORACLE_STALE_RATIO_THRESHOLD` | `0.5` |
+
+`docs/alerts/exchange-rate-oracle-cache.rules.yml` alerts on unhealthy state,
+error ratio, repeated timeouts, a high stale ratio, and p99 load latency
+above 5s. A unit test checks that every metric named in the rules file is
+registered.
+
+Failed loads are logged at `warn` with outcome, duration, status and error
+message. The cache key is not logged. A failure inside the metrics client is
+swallowed so it cannot replace the loader's error.
+
+## 9. Tests
+
 The suites were mutation-checked against `exchange-rate-cache.js`. Disabling
 single-flight fails 16 tests. Dropping the invalidation guard fails 4.
 
 ```
-npx vitest run src/lib/exchange-rate-cache.test.js \
+npx vitest run src/lib/exchange-rate-oracle-telemetry.test.js \
+               src/lib/exchange-rate-cache.test.js \
                src/lib/exchange-rate-coordinator.test.js \
                src/services/exchangeRateService.test.js \
                tests/integration/exchange-rate-cache.test.js

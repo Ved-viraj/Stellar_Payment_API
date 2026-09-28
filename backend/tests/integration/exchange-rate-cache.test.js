@@ -19,6 +19,7 @@ import { createApp } from '../../src/app.js';
 import { closePool } from '../../src/lib/db.js';
 import { findStrictReceivePaths } from '../../src/lib/stellar.js';
 import { resetExchangeRateCache, generateRateCacheKey } from '../../src/lib/exchange-rate-cache.js';
+import { resetExchangeRateOracleHealth } from '../../src/lib/exchange-rate-oracle-telemetry.js';
 import {
   configureExchangeRateCoordination,
   resetExchangeRateCoordination,
@@ -150,6 +151,7 @@ describe('Exchange Rate Oracle Cache — HTTP integration', () => {
     for (let i = 1; i <= 5; i++) seedPayment(i, `${i}.0000000`);
     resetExchangeRateCache();
     resetExchangeRateCoordination();
+    resetExchangeRateOracleHealth();
     findStrictReceivePaths.mockReset();
     findStrictReceivePaths.mockImplementation(async ({ destAmount }) => horizonPath(destAmount));
   });
@@ -254,6 +256,21 @@ describe('Exchange Rate Oracle Cache — HTTP integration', () => {
     expect(res.text).toContain('exchange_rate_cache_inflight_loads');
     expect(res.text).toContain('exchange_rate_lock_acquisitions_total');
     expect(res.text).toContain('exchange_rate_coordination_fallbacks_total');
+    expect(res.text).toContain('exchange_rate_oracle_cache_health_state');
+    expect(res.text).toContain('exchange_rate_oracle_cache_loads_total');
+  });
+
+  it('reports oracle cache health without quote or account data', async () => {
+    expect((await quote(app)).status).toBe(200);
+    const res = await request(app).get('/health/exchange-rate-oracle-cache');
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ status: 'healthy', success: 1, errors: 0 });
+    expect(res.body.thresholds.min_samples).toBeGreaterThan(0);
+    expect(JSON.stringify(res.body)).not.toContain(SOURCE_ACCOUNT);
+    expect(JSON.stringify(res.body)).not.toContain('USDC');
+
+    const health = await request(app).get('/health');
+    expect(health.body.services.exchange_rate_oracle_cache).toBe('healthy');
   });
 
   describe('with Redis coordination', () => {

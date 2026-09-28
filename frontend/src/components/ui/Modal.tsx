@@ -5,9 +5,10 @@ interface ModalProps {
   onClose: () => void;
   title: string;
   children: React.ReactNode;
+  descriptionId?: string;
 }
 
-export const Modal: React.FC<ModalProps> = ({ isOpen, onClose, title, children }) => {
+export const Modal: React.FC<ModalProps> = ({ isOpen, onClose, title, children, descriptionId }) => {
   const dialogRef = useRef<HTMLDivElement>(null);
   const titleId = useId();
 
@@ -86,12 +87,13 @@ export const Modal: React.FC<ModalProps> = ({ isOpen, onClose, title, children }
       {/* However, the PaymentDetail was a right sliding sheet. We'll build a standard modal dialog. */}
       <div
         ref={dialogRef}
-        className="dark fixed left-1/2 top-1/2 z-50 w-full max-w-md -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-white/10 bg-slate-900 p-6 shadow-2xl transition-all"
-        data-testid="modal-content"
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
+        aria-describedby={descriptionId}
         tabIndex={-1}
+        className="dark fixed left-1/2 top-1/2 z-50 w-full max-w-md -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-white/10 bg-slate-900 p-6 shadow-2xl transition-all focus:outline-none"
+        data-testid="modal-content"
       >
         <div className="flex items-center justify-between border-b border-white/10 pb-4 mb-4">
           <p id={titleId} className="font-mono text-xs uppercase tracking-[0.3em] text-mint">{title}</p>

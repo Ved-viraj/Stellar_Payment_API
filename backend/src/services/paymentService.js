@@ -5,6 +5,7 @@ import {
   createRefundTransaction,
   findStrictReceivePaths,
   verifyTransactionSignature,
+  isValidTransactionHash,
 } from "../lib/stellar.js";
 import { resolveBrandingConfig } from "../lib/branding.js";
 import { sendWebhook } from "../lib/webhooks.js";
@@ -27,12 +28,9 @@ import {
 } from "../lib/metrics.js";
 import { paymentSignatureVerifier } from "../lib/payment-signature-verification.js";
 import { logger } from "../lib/logger.js";
-import {
-  resolveAndValidateIssuer,
-  validatePerAssetLimits,
-  validateAllowedIssuers,
-} from "../lib/payment-session-rules.js";
+import { validatePaymentSession } from "../lib/payment-session-validator.js";
 import { getSupabaseClient } from "../lib/supabase-client.js";
+import { insertPaymentSessionWithRetry } from "../lib/payment-session-retry.js";
 import {
   paymentProcessorSessionsTotal,
   paymentProcessorSessionDuration,
@@ -460,26 +458,35 @@ export const paymentService = {
   async createPaymentSession(merchant, body) {
     const sessionStart = Date.now();
     const recordSessionOutcome = (outcome) => {
-      paymentProcessorSessionsTotal.inc({ asset: body.asset, outcome });
+      paymentProcessorSessionsTotal.inc({ asset: body?.asset, outcome });
       paymentProcessorSessionDuration.observe(
-        { asset: body.asset, outcome },
+        { asset: body?.asset, outcome },
         (Date.now() - sessionStart) / 1000,
       );
     };
     const supabase = await getSupabaseClient();
-    const asset = body.asset?.toUpperCase();
 
-    // Shared business-rule validation (issue #1087) — issuer presence/format.
-    const { assetIssuer, rejection: issuerRejection } = resolveAndValidateIssuer(
-      asset,
-      body.asset_issuer,
-    );
-    if (issuerRejection) {
+    // Sanitization, strict payload checks and shared business rules
+    // (issues #1087, #1447) with validator metrics/health (#1448). These are
+    // pure and cheap, so they run before the on-chain issuer lookup below —
+    // an invalid request never costs a Horizon round-trip.
+    const validation = validatePaymentSession({ body, merchant, source: "service" });
+    if (!validation.ok) {
+      const { rejection } = validation;
+      paymentFailedCounter.inc({
+        asset: body?.asset,
+        reason: rejection.reason === "issuer_not_allowed" ? "invalid_issuer" : rejection.reason,
+      });
       recordSessionOutcome("validation_failed");
-      const error = new Error(issuerRejection.message);
+      const error = new Error(rejection.message);
       error.status = 400;
+      if (rejection.rule === "limits") {
+        error.details = rejection.details;
+      }
       throw error;
     }
+    body = validation.payload;
+    const { asset, assetIssuer } = validation;
 
     // Task #756: Dynamic Issuer Verification with Error Recovery
     if (asset !== "XLM" && assetIssuer) {
@@ -499,36 +506,6 @@ export const paymentService = {
           throw recoveryError;
         }
       }
-    }
-
-    // Shared business-rule validation (issue #1087) — per-asset limits.
-    const limitRejection = validatePerAssetLimits({
-      rawAsset: body.asset,
-      amount: body.amount,
-      paymentLimits: merchant.payment_limits,
-    });
-    if (limitRejection) {
-      paymentFailedCounter.inc({ asset: body.asset, reason: limitRejection.reason });
-      recordSessionOutcome("validation_failed");
-      const error = new Error(limitRejection.message);
-      error.status = 400;
-      error.details = limitRejection.details;
-      throw error;
-    }
-
-    // Shared business-rule validation (issue #1087) — allowed issuers.
-    const allowedIssuers = merchant.allowed_issuers;
-    const allowlistRejection = validateAllowedIssuers({
-      asset,
-      assetIssuer,
-      allowedIssuers,
-    });
-    if (allowlistRejection) {
-      paymentFailedCounter.inc({ asset: body.asset, reason: "invalid_issuer" });
-      recordSessionOutcome("validation_failed");
-      const error = new Error(allowlistRejection.message);
-      error.status = 400;
-      throw error;
     }
 
     const paymentId = randomUUID();
@@ -576,9 +553,10 @@ export const paymentService = {
       created_at: now,
     };
 
-    const { error: insertError } = await supabase.from("payments").insert(payload);
-
-    if (insertError) {
+    // Issue #1449: retry transient persistence failures with backoff.
+    try {
+      await insertPaymentSessionWithRetry(supabase, payload);
+    } catch (insertError) {
       insertError.status = 500;
       recordSessionOutcome("persistence_failed");
       throw insertError;
@@ -600,7 +578,7 @@ export const paymentService = {
     const supabase = await getSupabaseClient();
     // --- Redis read-through cache ---
     const redis = await connectRedisClient();
-    const cached = await getCachedPayment(redis, paymentId);
+    const cached = await getCachedPayment(redis, paymentId, merchantId);
     if (cached) {
       paymentProcessorStatusCacheHits.inc();
       return { payment: cached };
@@ -644,7 +622,7 @@ export const paymentService = {
     delete response.merchants;
 
     // Cache the result to absorb polling bursts
-    await setCachedPayment(redis, paymentId, response);
+    await setCachedPayment(redis, paymentId, response, merchantId);
 
     return { payment: response };
   },
@@ -735,23 +713,45 @@ export const paymentService = {
     const now = new Date();
     const latencySeconds = (now - createdAt) / 1000;
 
-    const { error: updateError } = await supabase
+    // Conditional update (issue #1310): the initial `data.status === "confirmed"`
+    // check above and this write are not atomic — two concurrent calls to
+    // verifyPayment() for the same paymentId (e.g. a webhook-triggered check
+    // racing a client poll) can both read "pending" before either writes.
+    // Filtering the UPDATE on the status this call observed, and checking
+    // whether a row actually matched, makes only ONE of the racing calls the
+    // winner. The loser's `updatedRows` comes back empty and it must not
+    // proceed to fire webhooks/sockets/emails or bump confirmation metrics a
+    // second time for a payment another call already confirmed.
+    const { data: updatedRows, error: updateError } = await supabase
       .from("payments")
       .update({
         status: "confirmed",
         tx_id: match.transaction_hash,
         completion_duration_seconds: Math.floor(latencySeconds)
       })
-      .eq("id", data.id);
+      .eq("id", data.id)
+      .eq("status", data.status)
+      .select("id");
 
     if (updateError) {
       updateError.status = 500;
       throw updateError;
     }
 
-    // Invalidate cache
+    if (!updatedRows || updatedRows.length === 0) {
+      // Another concurrent call already confirmed this payment between our
+      // read and this write. Report success without repeating side effects.
+      recordVerificationOutcome("already_confirmed_concurrent");
+      return {
+        status: "confirmed",
+        tx_id: match.transaction_hash,
+        ledger_url: `https://stellar.expert/explorer/testnet/tx/${match.transaction_hash}`,
+      };
+    }
+
+    // Invalidate cache (both the public and merchant-scoped entries — #1311)
     const redis = await connectRedisClient();
-    await invalidatePaymentCache(redis, data.id);
+    await invalidatePaymentCache(redis, data.id, data.merchant_id);
 
     // Record metrics
     paymentConfirmedCounter.inc({ asset: data.asset });
@@ -906,6 +906,13 @@ export const paymentService = {
           ...payment.metadata,
           refund_status: "pending",
           refund_xdr: refundTx.xdr,
+          // The Stellar transaction hash is computed over the unsigned
+          // envelope + network passphrase, not the signatures — it is
+          // stable once this merchant signs and submits refundTx.xdr
+          // unmodified. Recording it now lets confirmRefundTx verify the
+          // caller-supplied tx_hash actually corresponds to the refund we
+          // generated, rather than accepting any string (issue #1309).
+          refund_tx_hash_expected: refundTx.hash,
           refund_created_at: new Date().toISOString(),
         },
       })
@@ -940,6 +947,70 @@ export const paymentService = {
     if (!payment) {
       const err = new Error("Payment not found");
       err.status = 404;
+      throw err;
+    }
+
+    // Verify the caller-supplied tx_hash before ever marking a refund
+    // "refunded" (issue #1309). Previously this call took the merchant's
+    // word for it with no check at all — a merchant could call this
+    // endpoint with any string and the payment would be recorded as
+    // refunded without funds ever moving.
+    if (!isValidTransactionHash(txHash)) {
+      const err = new Error("Invalid transaction hash");
+      err.status = 400;
+      throw err;
+    }
+
+    const expectedHash = payment.metadata?.refund_tx_hash_expected;
+    if (!expectedHash) {
+      // generateRefundTx was never called for this payment (or predates
+      // this field) — there is nothing to verify the submitted hash
+      // against, so refuse rather than accept it on faith.
+      paymentProcessorRefundsTotal.inc({ stage: "confirm", outcome: "rejected" });
+      const err = new Error(
+        "No pending refund found for this payment. Call the refund endpoint first.",
+      );
+      err.status = 400;
+      throw err;
+    }
+
+    if (txHash.toLowerCase() !== expectedHash.toLowerCase()) {
+      paymentProcessorRefundsTotal.inc({ stage: "confirm", outcome: "rejected" });
+      const err = new Error(
+        "Transaction hash does not match the refund transaction generated for this payment",
+      );
+      err.status = 400;
+      throw err;
+    }
+
+    // Confirm the transaction actually landed on-chain and succeeded — a
+    // hash match alone only proves the merchant built the right envelope,
+    // not that they ever signed and submitted it.
+    const StellarSdk = await import("stellar-sdk");
+    const HORIZON_URL =
+      process.env.STELLAR_HORIZON_URL ||
+      (process.env.STELLAR_NETWORK === "public"
+        ? "https://horizon.stellar.org"
+        : "https://horizon-testnet.stellar.org");
+    const server = new StellarSdk.Horizon.Server(HORIZON_URL);
+
+    let onChainTx;
+    try {
+      onChainTx = await server.transactions().transaction(txHash).call();
+    } catch (horizonErr) {
+      paymentProcessorRefundsTotal.inc({ stage: "confirm", outcome: "not_found" });
+      const err = new Error(
+        "Transaction not found on Stellar network. Submit it before confirming.",
+      );
+      err.status = 400;
+      err.cause = horizonErr;
+      throw err;
+    }
+
+    if (!onChainTx.successful) {
+      paymentProcessorRefundsTotal.inc({ stage: "confirm", outcome: "failed_on_chain" });
+      const err = new Error("Refund transaction failed on the Stellar network");
+      err.status = 400;
       throw err;
     }
 

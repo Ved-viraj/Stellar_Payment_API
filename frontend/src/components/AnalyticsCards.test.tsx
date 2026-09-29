@@ -1,6 +1,10 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import React from "react";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import "@testing-library/jest-dom/vitest";
+import AnalyticsCards from "./AnalyticsCards";
+
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import AnalyticsCards from "./AnalyticsCards";
@@ -53,6 +57,9 @@ function mockFetchSuccess() {
     .mockResolvedValueOnce({ ok: true, json: async () => PAYMENTS_RESPONSE });
 }
 
+describe("AnalyticsCards", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
 function setViewport(width: number) {
   window.matchMedia = vi.fn().mockImplementation((query: string) => ({
     matches: query.includes("max-width") && width <= 640,
@@ -184,6 +191,30 @@ describe("AnalyticsCards", () => {
 
       await waitFor(() => screen.getByText("Total Volume (7D)"));
       fireEvent.click(screen.getByText("Total Volume (7D)").closest("button")!);
+
+      const dialog = screen.getByRole("dialog");
+      const closeButton = screen.getByTestId("modal-close");
+
+      // Only the close button is focusable inside this dialog's body (plain text detail).
+      closeButton.focus();
+      expect(document.activeElement).toBe(closeButton);
+
+      fireEvent.keyDown(document, { key: "Tab" });
+      expect(document.activeElement).toBe(closeButton);
+      void dialog;
+    });
+
+    it("restores focus to the triggering card when closed", async () => {
+      mockFetchSuccess();
+      render(<AnalyticsCards />);
+
+      await waitFor(() => screen.getByText("Total Volume (7D)"));
+      const trigger = screen.getByText("Total Volume (7D)").closest("button")!;
+      trigger.focus();
+      fireEvent.click(trigger);
+
+      fireEvent.keyDown(document, { key: "Escape" });
+      expect(document.activeElement).toBe(trigger);
       expect(screen.getByTestId("analytics-card-dialog")).toBeInTheDocument();
 
       fireEvent.keyDown(document, { key: "Escape" });

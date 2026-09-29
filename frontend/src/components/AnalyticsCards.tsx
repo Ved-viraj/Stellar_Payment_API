@@ -12,6 +12,7 @@ import {
   useDisplayPreferences,
   formatAmount,
 } from "@/lib/display-preferences";
+import { Modal } from "./ui/Modal";
 
 interface MetricsResponse {
   total_volume: number;
@@ -71,6 +72,7 @@ export default function AnalyticsCards() {
   const [successRate, setSuccessRate] = useState<number>(0);
   const [activeIntents, setActiveIntents] = useState<number>(0);
   const [loading, setLoading] = useState(true);
+  const [openCardId, setOpenCardId] = useState<string | null>(null);
   const [networkError, setNetworkError] = useState(false);
   const [openCardId, setOpenCardId] = useState<string | null>(null);
   const [retryNonce, setRetryNonce] = useState(0);
@@ -188,8 +190,32 @@ export default function AnalyticsCards() {
     );
   }
 
+  const cards: CardDetail[] = [
+    {
+      id: "total-volume",
+      label: "Total Volume (7D)",
+      value: formatAmount(totalVolume, locale, hideCents),
+      description: "Total payment volume processed across all confirmed transactions in the last 7 days.",
+    },
+    {
+      id: "success-rate",
+      label: "Success Rate",
+      value: `${successRate.toFixed(1)}%`,
+      description: "Share of resolved payments (confirmed vs. confirmed + failed/refunded) in the last 7 days. Pending payments aren't counted until they resolve.",
+    },
+    {
+      id: "active-intents",
+      label: "Active intents",
+      value: String(activeIntents),
+      description: "Payments currently awaiting confirmation. These are not yet counted in the success rate above.",
+    },
+  ];
+
+  const openCard = cards.find((c) => c.id === openCardId) ?? null;
+
   return (
     <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+      {cards.map((card) => (
       {networkError && (
         <div
           role="alert"
@@ -239,6 +265,18 @@ export default function AnalyticsCards() {
         </button>
       ))}
 
+      <Modal
+        isOpen={openCard !== null}
+        onClose={() => setOpenCardId(null)}
+        title={openCard?.label ?? ""}
+      >
+        {openCard && (
+          <div className="flex flex-col gap-3">
+            <p className="text-3xl font-bold tracking-tight">{openCard.value}</p>
+            <p className="text-sm text-slate-300">{openCard.description}</p>
+          </div>
+        )}
+      </Modal>
       {isMobile ? (
         <AnalyticsCardDrawer
           card={openCard}

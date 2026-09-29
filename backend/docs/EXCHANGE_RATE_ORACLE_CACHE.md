@@ -4,6 +4,7 @@ Caching and concurrency control for path-payment exchange-rate quotes
 (`GET /api/path-payment-quote/:id`).
 
 Covers issues **#1443** (Prometheus alert metrics and health telemetry),
+**#1444** (automated retry with exponential backoff),
 **#1445** (distributed concurrency control and locking) and
 **#1446** (integration and stress test suite).
 
@@ -18,7 +19,8 @@ Covers issues **#1443** (Prometheus alert metrics and health telemetry),
 | `src/services/exchangeRateService.js` | `getExchangeRateQuote()` composes both layers around the Horizon query |
 | `src/lib/path-payment-metrics.js` | Prometheus series (existing cache metrics + concurrency metrics) |
 | `src/lib/exchange-rate-oracle-telemetry.js` | Alert metrics, rolling-window health, separate registry (#1443) |
-| `docs/alerts/exchange-rate-oracle-cache.rules.yml` | Prometheus alert rules (#1443) |
+| `src/lib/exchange-rate-oracle-retry.js` | Full-jitter exponential backoff around the Horizon read (#1444) |
+| `docs/alerts/exchange-rate-oracle-cache.rules.yml` | Prometheus alert rules (#1443, #1444) |
 
 ```
 getExchangeRateQuote(key)
@@ -208,13 +210,44 @@ Failed loads are logged at `warn` with outcome, duration, status and error
 message. The cache key is not logged. A failure inside the metrics client is
 swallowed so it cannot replace the loader's error.
 
-## 9. Tests
+| Metric | Type | Labels |
+|---|---|---|
+| `exchange_rate_oracle_cache_retries_total` | counter | `result` (scheduled/recovered/exhausted) |
+
+## 9. Retry with exponential backoff (#1444)
+
+`getExchangeRateQuote()` wraps the Horizon read in `withOracleRetry()`. The
+wrapper sits inside `ExchangeRateCache.getOrLoad()`, so concurrent callers
+for the same key share one retry loop. Cache hits do not retry. Redis lock
+polling is unchanged.
+
+Delay is full jitter: `random(0, min(maxDelayMs, baseDelayMs * 2^n))`.
+Defaults are 3 attempts, 100ms base, 1000ms cap. Env and callers cannot
+exceed 6 attempts or 10s of delay.
+
+| Variable | Default |
+|---|---|
+| `EXCHANGE_RATE_ORACLE_RETRY_MAX_ATTEMPTS` | `3` |
+| `EXCHANGE_RATE_ORACLE_RETRY_BASE_DELAY_MS` | `100` |
+| `EXCHANGE_RATE_ORACLE_RETRY_MAX_DELAY_MS` | `1000` |
+
+Retried: network errors, HTTP 408, 429, and 5xx except 501.
+Not retried: `NoPathFoundError` (404), other 4xx, `CacheLoadTimeoutError`,
+and any error with `retryable: false`. The last error is rethrown with
+`retryAttempts` set, and it is not cached. The outer load timeout still
+bounds how long HTTP waiters block.
+
+The quote is a read of public DEX data, so a retry cannot submit a payment.
+`ExchangeRateOracleCacheRetriesExhausted` fires when a load gives up.
+
+## 10. Tests
 
 The suites were mutation-checked against `exchange-rate-cache.js`. Disabling
 single-flight fails 16 tests. Dropping the invalidation guard fails 4.
 
 ```
 npx vitest run src/lib/exchange-rate-oracle-telemetry.test.js \
+               src/lib/exchange-rate-oracle-retry.test.js \
                src/lib/exchange-rate-cache.test.js \
                src/lib/exchange-rate-coordinator.test.js \
                src/services/exchangeRateService.test.js \

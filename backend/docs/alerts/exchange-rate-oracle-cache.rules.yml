@@ -63,6 +63,17 @@ groups:
             Quotes are being refreshed constantly. The TTL may be shorter than
             the request interval, or invalidation is too aggressive.
 
+      - alert: ExchangeRateOracleCacheRetriesExhausted
+        expr: sum(increase(exchange_rate_oracle_cache_retries_total{result="exhausted"}[10m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Exchange-rate oracle retries were exhausted
+          description: >
+            A quote load kept failing after exponential backoff. The last error
+            is returned to the caller and is not cached. Check Horizon.
+
       - alert: ExchangeRateOracleCacheSlowLoads
         expr: |
           histogram_quantile(0.99,

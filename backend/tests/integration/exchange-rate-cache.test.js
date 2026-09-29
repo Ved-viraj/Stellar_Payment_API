@@ -13,6 +13,8 @@ vi.hoisted(() => {
   process.env.PATH_PAYMENT_QUOTE_RATE_LIMIT_MAX = '100000';
   // Wide enough that every request in a burst joins the load before it times out.
   process.env.EXCHANGE_RATE_LOAD_TIMEOUT_MS = '1000';
+  process.env.EXCHANGE_RATE_ORACLE_RETRY_BASE_DELAY_MS = '0';
+  process.env.EXCHANGE_RATE_ORACLE_RETRY_MAX_DELAY_MS = '0';
 });
 
 import { createApp } from '../../src/app.js';
@@ -210,11 +212,11 @@ describe('Exchange Rate Oracle Cache — HTTP integration', () => {
   });
 
   it('fails every waiter on a Horizon error without caching it', async () => {
-    const horizon = gatedHorizon();
-    const burst = await burstJoined(app, horizon, 10);
-    horizon.failAll(Object.assign(new Error('Horizon 503'), { status: 502 }));
-    const responses = await Promise.all(burst);
+    findStrictReceivePaths.mockRejectedValue(Object.assign(new Error('Horizon 503'), { status: 502 }));
+    const responses = await Promise.all(Array.from({ length: 10 }, () => quote(app)));
     expect(responses.every((r) => r.status === 502)).toBe(true);
+    // One single-flight load, retried to the attempt ceiling — not once per waiter.
+    expect(findStrictReceivePaths).toHaveBeenCalledTimes(3);
 
     findStrictReceivePaths.mockImplementation(async ({ destAmount }) => horizonPath(destAmount));
     expect((await quote(app)).status).toBe(200);

@@ -72,8 +72,16 @@ export const exchangeRateOracleLastLoadTimestamp = new client.Gauge({
   help: 'Unix time of the most recent exchange-rate oracle cache load',
 });
 
+/** result: scheduled | recovered | exhausted (issue #1444) */
+export const exchangeRateOracleRetriesTotal = new client.Counter({
+  name: 'exchange_rate_oracle_cache_retries_total',
+  help: 'Exchange-rate oracle fetch retries with exponential backoff, by result',
+  labelNames: ['result'],
+});
+
 const LOOKUP_RESULTS = new Set(['hit', 'miss', 'stale']);
 const LOAD_OUTCOMES = new Set(['success', 'error', 'timeout', 'not_found']);
+const RETRY_RESULTS = new Set(['scheduled', 'recovered', 'exhausted']);
 
 export const HEALTH_STATE_VALUES = Object.freeze({ healthy: 0, degraded: 1, unhealthy: 2 });
 
@@ -313,5 +321,14 @@ register.registerMetric(exchangeRateOracleErrorRatio);
 register.registerMetric(exchangeRateOracleTimeoutRatio);
 register.registerMetric(exchangeRateOracleStaleRatio);
 register.registerMetric(exchangeRateOracleLastLoadTimestamp);
+register.registerMetric(exchangeRateOracleRetriesTotal);
+
+/** @param {'scheduled'|'recovered'|'exhausted'} result */
+export function recordOracleRetry(result) {
+  const safe = RETRY_RESULTS.has(result) ? result : 'exhausted';
+  safeRecord(() => {
+    exchangeRateOracleRetriesTotal.inc({ result: safe });
+  });
+}
 
 export { register as exchangeRateOracleRegister };
